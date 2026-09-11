@@ -24,14 +24,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils.scoring import (
+from scoring import (
     compute_risk_breakdown,
     compute_risk_score,
     risk_level,
     compute_decision_priority,
     compute_response_effectiveness,
 )
-from utils.analysis import (
+
+from analysis import (
     predict_spread,
     optimal_intervention_window,
     build_spread_timeseries,
@@ -40,8 +41,9 @@ from utils.analysis import (
     response_time_breakdown,
     compute_reduction_vs_baseline,
 )
-from utils.decision_engine import DECISION_OPTIONS, recommend_action
-from utils.response_generator import generate_response
+
+from decision_engine import DECISION_OPTIONS, recommend_action
+from response_generator import generate_response
 
 # =============================================================================
 # إعدادات الصفحة العامة
