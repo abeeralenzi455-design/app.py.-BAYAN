@@ -1,5 +1,6 @@
 import html
 import random
+import re
 import threading
 import streamlit as st
 
@@ -7,9 +8,11 @@ st.set_page_config(page_title="ليلة المواجهة", page_icon="🎡", lay
 
 # ══════════ إعدادات يعدّلها المقدم ══════════
 ROOM_LINK_TEXT = "رابط خاص في روم مزح ولعب"
-ROOM_ID = "31130"
+ROOM_ID = "311130"
 PLATFORM_TEXT = "تنسيق منصة المواجهة :"
-PRESENTER_DEFAULT = ""          # اسم المقدم الافتراضي (تقدر تكتبه هنا أو من لوحة المقدم)
+PRESENTER_DEFAULT = ""
+MAX_NAMES = 30          # أقصى عدد أسماء
+MAX_NAME_LEN = 20       # أقصى طول للاسم
 
 
 def _secret(key, default):
@@ -142,14 +145,22 @@ CATS = [
         "كيف تتخيل يومك المثالي من الاستيقاظ حتى النوم؟"]},
 ]
 
+NAME_COLORS = ["#e85d75", "#8064d8", "#e66b9a", "#e8a23a", "#249eaa", "#4d9a79", "#5b8def", "#f0793a"]
+
+
 # ══════════ الغرفة المشتركة (يشوفها كل اللاعبين) ══════════
 @st.cache_resource
 def get_room():
     return {
         "lock": threading.Lock(),
-        "round": 0, "cat": None, "q": None, "anim": False,
+        "phase": "register",            # register = تسجيل الأسماء | play = اللعب
+        "names": [], "used_names": set(),
+        "stage": None,                  # None | name | question
+        "nround": 0, "nanim": False,    # عجلة الأسماء
+        "player": "",
+        "round": 0, "cat": None, "q": None, "anim": False,   # عجلة الأسئلة
         "hist": [], "used": set(),
-        "player": "", "presenter": PRESENTER_DEFAULT,
+        "presenter": PRESENTER_DEFAULT,
         "answers": [], "skipped": False,
     }
 
@@ -157,10 +168,117 @@ def get_room():
 room = get_room()
 ss = st.session_state
 ss.setdefault("dark", False)
+ss.setdefault("role", None)          # None | player | host
 ss.setdefault("is_host", False)
+ss.setdefault("ask_host", False)
+ss.setdefault("my_names", [])
 ss.setdefault("answering", None)
+ss.setdefault("flash", "")
 
 esc = html.escape
+
+
+def _norm(s):
+    return " ".join(str(s).split()).casefold()
+
+
+# ══════════ الدخول ══════════
+def choose_player():
+    ss.role = "player"
+    ss.ask_host = False
+
+
+def want_host():
+    ss.ask_host = True
+
+
+def login_host():
+    if str(ss.get("pin_in", "")) == HOST_PIN:
+        ss.role, ss.is_host, ss.ask_host = "host", True, False
+        ss.flash = ""
+    else:
+        ss.flash = "الرمز غير صحيح"
+
+
+def logout():
+    ss.role, ss.is_host, ss.ask_host, ss.flash = None, False, False, ""
+
+
+# ══════════ التسجيل ══════════
+def add_names():
+    raw = str(ss.get("name_in", ""))
+    parts = [p.strip() for p in re.split(r"[,\n،;؛]+", raw) if p.strip()]
+    added, dup, full = 0, 0, False
+    with room["lock"]:
+        have = {_norm(n) for n in room["names"]}
+        for p in parts:
+            p = p[:MAX_NAME_LEN]
+            if _norm(p) in have:
+                dup += 1
+            elif len(room["names"]) >= MAX_NAMES:
+                full = True
+                break
+            else:
+                room["names"].append(p)
+                have.add(_norm(p))
+                ss.my_names.append(p)
+                added += 1
+    msg = []
+    if added:
+        msg.append(f"✅ تمت إضافة {added}")
+    if dup:
+        msg.append(f"⚠️ {dup} مكرر")
+    if full:
+        msg.append("⚠️ وصلنا الحد الأقصى للأسماء")
+    ss.flash = " · ".join(msg)
+
+
+def remove_name(n):
+    if not ss.is_host:
+        return
+    with room["lock"]:
+        if n in room["names"]:
+            room["names"].remove(n)
+
+
+def confirm_names():
+    """التأكيد للمقدم فقط."""
+    if not ss.is_host:
+        return
+    with room["lock"]:
+        if len(room["names"]) < 2:
+            return
+        room.update(phase="play", stage=None, player="", cat=None, q=None, anim=False,
+                    nanim=False, answers=[], skipped=False, hist=[], round=0, nround=0)
+        room["used"].clear()
+        room["used_names"].clear()
+
+
+def back_to_register():
+    if not ss.is_host:
+        return
+    with room["lock"]:
+        room.update(phase="register", stage=None, player="", cat=None, q=None, anim=False,
+                    nanim=False, answers=[], skipped=False)
+
+
+# ══════════ اللعب ══════════
+def spin_names():
+    if not ss.is_host:
+        return
+    with room["lock"]:
+        names = room["names"]
+        if not names:
+            return
+        pool = [n for n in names if n not in room["used_names"]]
+        if not pool:
+            room["used_names"].clear()
+            pool = list(names)
+        p = random.choice(pool)
+        room["used_names"].add(p)
+        room.update(player=p, stage="name", nanim=True, cat=None, q=None, anim=False,
+                    answers=[], skipped=False)
+        room["nround"] += 1
 
 
 def _draw(keep_cat):
@@ -174,37 +292,49 @@ def _draw(keep_cat):
             pool = list(c["q"])
         q = random.choice(pool)
         room["used"].add(q)
-        room.update(cat=i, q=q, anim=not had, answers=[], skipped=False)
+        room.update(cat=i, q=q, anim=not had, answers=[], skipped=False, stage="question")
         room["round"] += 1
-        room["hist"] = ([f'{c["emoji"]} {c["name"]}'] + room["hist"])[:6]
+        room["hist"] = ([f'{room["player"]} — {c["emoji"]} {c["name"]}'] + room["hist"])[:6]
 
 
-def spin():
-    _draw(False)
+def spin_q():
+    if ss.is_host and room["player"]:
+        _draw(False)
 
 
 def new_q():
-    _draw(True)
+    if ss.is_host and room["player"]:
+        _draw(True)
 
 
 def reset():
+    if not ss.is_host:
+        return
     with room["lock"]:
-        room.update(round=0, cat=None, q=None, anim=False, hist=[],
-                    answers=[], skipped=False)
+        room.update(stage=None, player="", cat=None, q=None, anim=False, nanim=False,
+                    hist=[], answers=[], skipped=False, round=0, nround=0)
         room["used"].clear()
+        room["used_names"].clear()
+
+
+def _is_turn_owner():
+    p = room["player"]
+    return bool(p) and p in ss.my_names
 
 
 def do_skip():
-    room["skipped"] = True
+    if _is_turn_owner():                 # فقط صاحب الاسم اللي طلع بالعجلة
+        room["skipped"] = True
 
 
 def open_answer():
-    ss.answering = room["round"]
+    if _is_turn_owner():
+        ss.answering = room["round"]
 
 
 def submit_answer():
     t = str(ss.get("ans_text", "")).strip()
-    if t:
+    if t and _is_turn_owner():
         with room["lock"]:
             room["answers"] = (room["answers"] + [{"who": room["player"], "text": t[:300]}])[-20:]
         ss.answering = None
@@ -214,7 +344,7 @@ def toggle_theme():
     ss.dark = not ss.dark
 
 
-# ══════════ الثيم (مستقل عن وضع الجوال) ══════════
+# ══════════ الثيم ══════════
 LIGHT = dict(bg="linear-gradient(135deg,#fff8ec,#f7f2ff)", card="#ffffff", txt="#34243f",
              sub="#786b83", chip="#f1ecfa", inp="#ffffff", bd="#e4d9f5", scheme="light")
 DARK = dict(bg="linear-gradient(135deg,#171021,#261a3a)", card="#2c2142", txt="#f4edff",
@@ -237,11 +367,9 @@ html, body, [data-testid="stAppViewContainer"], .main { direction: rtl; text-ali
 [data-testid="stHeader"] { background: transparent !important; }
 .stApp p, .stApp label, .stApp li, .stApp .stMarkdown { color: var(--txt); }
 
-/* الأعمدة تبقى جنب بعض حتى على الجوال */
 .stApp [data-testid="stHorizontalBlock"] { flex-direction: row !important; flex-wrap: nowrap !important; gap: 12px !important; }
 .stApp [data-testid="stColumn"], .stApp [data-testid="column"] { min-width: 0 !important; flex: 1 1 0 !important; width: auto !important; }
 
-/* المربعات العلوية */
 .badges { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-start; margin-bottom:10px; }
 .badge { background:linear-gradient(135deg,#ff8da7,#a58cf4); color:#fff !important; padding:8px 14px;
          border-radius:14px; font-weight:800; font-size:14px; box-shadow:0 3px 10px rgba(165,140,244,.35); }
@@ -254,7 +382,6 @@ html, body, [data-testid="stAppViewContainer"], .main { direction: rtl; text-ali
 .tagline { margin-top:12px; background:rgba(255,255,255,.22); border-radius:16px; padding:9px 14px;
            font-size:15px; font-weight:600; line-height:1.8; }
 
-/* الفئات */
 .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:6px; }
 .tile { color:#fff; border-radius:16px; padding:10px 2px; text-align:center; font-weight:700; }
 .tile .te { font-size:24px; }
@@ -262,41 +389,45 @@ html, body, [data-testid="stAppViewContainer"], .main { direction: rtl; text-ali
 .tile.on { outline:4px solid var(--txt); }
 
 /* العجلة */
-.wheelwrap { position:relative; width:190px; height:190px; margin:14px auto 6px; }
+.wheelwrap { position:relative; width:240px; height:240px; margin:14px auto 6px; }
 .ptr { position:absolute; top:-14px; left:50%; margin-left:-12px; font-size:24px; z-index:3; color:var(--txt); line-height:1; }
 .wheel { width:100%; height:100%; border-radius:50%; border:6px solid var(--card);
-         box-shadow:0 6px 18px rgba(0,0,0,.25); position:relative; }
+         box-shadow:0 6px 18px rgba(0,0,0,.25); position:relative; overflow:hidden; }
 .wl { position:absolute; top:50%; left:50%; margin:-14px 0 0 -14px; width:28px; height:28px;
       text-align:center; font-size:21px; line-height:28px; }
+.wn { position:absolute; top:50%; left:50%; width:84px; height:20px; margin-top:-10px;
+      transform-origin:0 50%; direction:ltr; text-align:left; white-space:nowrap; overflow:hidden;
+      text-overflow:ellipsis; font-size:13px; line-height:20px; font-weight:800; color:#fff;
+      text-shadow:0 1px 3px rgba(0,0,0,.55); }
 .hub { position:absolute; top:50%; left:50%; width:26px; height:26px; margin:-13px 0 0 -13px;
        border-radius:50%; background:var(--card); box-shadow:0 0 0 3px var(--bd); z-index:2; }
 
-/* مربع السؤال */
-.st-key-resbox { border:2px solid #ff8da7; background:var(--card); border-radius:22px; padding:20px 16px;
-                 margin:12px 0; }
+.st-key-resbox, .st-key-entrybox, .st-key-regbox { border:2px solid #ff8da7; background:var(--card);
+                 border-radius:22px; padding:20px 16px; margin:12px 0; }
 .center { text-align:center; }
 .tag { display:inline-block; background:#ffe0e9; color:#a53e61 !important; padding:6px 12px;
        border-radius:30px; font-weight:700; font-size:14px; }
 .presenter { margin:10px 0 2px; font-size:15px; font-weight:700; color:var(--txt); }
 .q { font-size:25px; font-weight:800; line-height:1.7; margin:10px 0; color:var(--txt); }
 .q.skipped { opacity:.45; text-decoration:line-through; }
+.who { font-size:30px; font-weight:800; color:#d6477a; margin:6px 0; }
 .small { color:var(--sub); font-size:13px; }
 .ans { background:var(--chip); border-radius:14px; padding:8px 12px; margin:8px 0; text-align:right;
        color:var(--txt); font-size:15px; }
-.hist span { display:inline-block; background:var(--chip); color:var(--txt); padding:6px 10px;
-             border-radius:30px; font-size:13px; margin:3px; }
+.hist span, .chips span { display:inline-block; background:var(--chip); color:var(--txt); padding:6px 12px;
+             border-radius:30px; font-size:14px; margin:3px; font-weight:700; }
 .st-key-hostbox { border:2px dashed var(--bd); background:var(--card); border-radius:18px; padding:14px 14px 6px;
                   margin-bottom:12px; }
 
-/* الأزرار */
 .stButton>button, .stFormSubmitButton>button { width:100%; border-radius:16px; font-weight:700; padding:.7rem;
   background:var(--card); color:var(--txt); border:1.5px solid var(--bd); }
 .stButton>button p, .stFormSubmitButton>button p { color:inherit !important; }
-.stButton>button[kind="primary"], button[data-testid="stBaseButton-primary"] {
+.stButton>button[kind="primary"], button[data-testid="stBaseButton-primary"],
+button[data-testid="stBaseButton-primaryFormSubmit"] {
   background:linear-gradient(135deg,#ff8da7,#a58cf4) !important; color:#fff !important; border:none !important; }
-button[data-testid="stBaseButton-primary"] p { color:#fff !important; }
+button[data-testid="stBaseButton-primary"] p, button[data-testid="stBaseButton-primaryFormSubmit"] p { color:#fff !important; }
+.stButton>button:disabled { opacity:.45; }
 
-/* الحقول */
 .stApp input, .stApp textarea { background:var(--inp) !important; color:var(--txt) !important;
   -webkit-text-fill-color:var(--txt) !important; }
 .stApp [data-baseweb="input"], .stApp [data-baseweb="base-input"], .stApp [data-baseweb="textarea"] {
@@ -304,9 +435,33 @@ button[data-testid="stBaseButton-primary"] p { color:#fff !important; }
 .stApp ::placeholder { color:var(--sub) !important; -webkit-text-fill-color:var(--sub) !important; opacity:1; }
 [data-testid="stExpander"], [data-testid="stForm"] { background:var(--card); border:1.5px solid var(--bd) !important;
   border-radius:16px; }
-[data-testid="stExpander"] summary, [data-testid="stExpander"] summary p { color:var(--txt) !important; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ══════════ مكوّن العجلة (للأسماء وللأسئلة) ══════════
+def wheel_html(items, rnd, idx, anim, pre, as_text):
+    n = len(items)
+    seg = 360 / n
+    final = 360 * 5 - (idx * seg + seg / 2) if idx is not None else 0
+    stops = ",".join(f'{it["color"]} {i * seg}deg {(i + 1) * seg}deg' for i, it in enumerate(items))
+    labels = ""
+    for i, it in enumerate(items):
+        mid = i * seg + seg / 2
+        if as_text:
+            labels += (f'<span class="wn" style="transform:rotate({mid - 90}deg) translateX(24px)">'
+                       f'{esc(it["label"])}</span>')
+        else:
+            labels += (f'<span class="wl" style="transform:rotate({mid}deg) translateY(-82px) '
+                       f'rotate({-mid}deg)">{it["label"]}</span>')
+    wstyle = (f"animation:{pre}{rnd} 3s cubic-bezier(.17,.67,.2,1) forwards;" if anim
+              else f"transform:rotate({final}deg);")
+    return (f'<style>@keyframes {pre}{rnd}{{from{{transform:rotate(0deg)}}to{{transform:rotate({final}deg)}}}}'
+            f'@keyframes rv{pre}{rnd}{{from{{opacity:0}}to{{opacity:1}}}}</style>'
+            f'<div class="wheelwrap"><div class="ptr">▼</div>'
+            f'<div class="wheel" style="background:conic-gradient({stops});{wstyle}">{labels}</div>'
+            f'<div class="hub"></div></div>')
+
 
 # ══════════ أعلى الصفحة ══════════
 st.markdown(
@@ -319,112 +474,180 @@ st.markdown(
 _, theme_col = st.columns([3, 2])
 theme_col.button("☀️ الوضع النهاري" if ss.dark else "🌙 الوضع الليلي", on_click=toggle_theme, key="theme_btn")
 
-st.markdown(
-    '<div class="hero"><div style="font-size:38px">🎡✨</div><h1>ليلة المواجهة</h1>'
-    '<div class="sub">اسأل.. واجه.. واكتشف!</div>'
-    '<div class="tagline">لمّة حلوة 💗 — العبوا بروح مرحة واحترموا حق أي لاعب في تخطي السؤال.</div></div>',
-    unsafe_allow_html=True)
 
-# ══════════ لوحة المقدم (الأسماء عند المقدم فقط) ══════════
-if ss.is_host:
-    with st.container(key="hostbox"):
-        st.markdown("**🎛️ لوحة المقدم**")
+# ══════════ 1) شاشة الدخول: مقدم أم لاعب ══════════
+def entry_screen():
+    with st.container(key="entrybox"):
+        st.markdown(
+            '<div class="center"><div style="font-size:46px">🎡👋</div>'
+            '<div class="q">أهلاً فيك في ليلة المواجهة</div>'
+            f'<div class="small">مزح ولعب <bdi dir="ltr">mL</bdi> · <bdi dir="ltr">ID: {ROOM_ID}</bdi></div>'
+            '<div class="presenter" style="margin-top:16px">هل أنت مقدم أم لاعب؟</div></div>',
+            unsafe_allow_html=True)
         c1, c2 = st.columns(2)
-        pres = c1.text_input("اسم المقدم", value=room["presenter"], key="presenter_in",
-                             placeholder="اسم المقدم...")
-        play = c2.text_input("🎤 اللاعب الحالي", value=room["player"], key="player_in",
-                             placeholder="اسم اللاعب...")
-        room["presenter"], room["player"] = pres.strip()[:40], play.strip()[:40]
+        c1.button("🎮 لاعب", on_click=choose_player, key="role_player", type="primary")
+        c2.button("🎤 مقدم", on_click=want_host, key="role_host")
+        if ss.ask_host:
+            with st.form("pin_form", border=False):
+                st.text_input("رمز المقدم", type="password", key="pin_in", placeholder="اكتب الرمز...")
+                st.form_submit_button("دخول", on_click=login_host)
+            if ss.flash:
+                st.error(ss.flash)
 
 
-# ══════════ الجزء الحي: يتحدث عند الكل كل ثانيتين ══════════
+# ══════════ 2) صفحة تسجيل الأسماء (واجهة اللاعبين، والمقدم يشوفها ويأكد) ══════════
+@st.fragment(run_every=2)
+def names_live():
+    if room["phase"] != "register":
+        st.rerun(scope="app")
+    names = list(room["names"])
+    mine = set(ss.my_names)
+    st.markdown(f'**👥 اللاعبين المسجلين ({len(names)})**')
+    if names:
+        st.markdown('<div class="chips">' + "".join(
+            f'<span>{"⭐ " if n in mine else ""}{esc(n)}</span>' for n in names) + '</div>',
+            unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="small">ما أحد سجّل للحين...</div>', unsafe_allow_html=True)
+    if ss.is_host:
+        if names:
+            with st.expander("🗑️ حذف اسم"):
+                for i, n in enumerate(names):
+                    st.button(f"✖ {n}", key=f"rm_{i}", on_click=remove_name, args=(n,))
+        if len(names) < 2:
+            st.markdown('<div class="small">لازم اسمين على الأقل قبل التأكيد.</div>', unsafe_allow_html=True)
+
+
+def register_screen():
+    st.markdown(
+        '<div class="hero"><div style="font-size:38px">📝</div><h1>تسجيل اللاعبين</h1>'
+        '<div class="sub">اكتب اسمك (أو أكثر من اسم) وانتظر المقدم يأكد</div></div>',
+        unsafe_allow_html=True)
+    with st.container(key="regbox"):
+        with st.form("name_form", clear_on_submit=True, border=False):
+            st.text_input("✍️ اكتب اسمك", key="name_in",
+                          placeholder="مثال: سارة  — أو أكثر من اسم بفاصلة: سارة، محمد")
+            st.form_submit_button("➕ إضافة", on_click=add_names)
+        if ss.flash:
+            st.markdown(f'<div class="small">{esc(ss.flash)}</div>', unsafe_allow_html=True)
+        names_live()
+
+    if ss.is_host:
+        st.button("✅ تأكيد وبدء اللعبة", on_click=confirm_names, type="primary", key="confirm_btn")
+    else:
+        st.markdown('<div class="center small">⏳ التأكيد وبدء اللعبة من المقدم فقط</div>',
+                    unsafe_allow_html=True)
+
+
+# ══════════ 3) صفحة اللعب (عجلة الأسماء ثم عجلة الأسئلة) ══════════
 @st.fragment(run_every=2)
 def live():
+    if room["phase"] != "play":
+        st.rerun(scope="app")
+
+    stage, names, player = room["stage"], list(room["names"]), room["player"]
     rnd, idx, q = room["round"], room["cat"], room["q"]
+    nrnd, nanim = room["nround"], room["nanim"]
     anim, skipped = room["anim"], room["skipped"]
-    answers = list(room["answers"])
-    hist = list(room["hist"])
-    n = len(CATS)
-    seg = 360 / n
-
-    # الفئات
-    tiles = "".join(
-        f'<div class="tile{" on" if i == idx else ""}" style="background:{c["color"]}">'
-        f'<div class="te">{c["emoji"]}</div><small>{c["name"]}</small></div>'
-        for i, c in enumerate(CATS))
-    st.markdown(f'<div class="tiles">{tiles}</div>', unsafe_allow_html=True)
-
-    # العجلة (تدور عند الكل مع كل دورة جديدة)
-    final = 360 * 5 - (idx * seg + seg / 2) if idx is not None else 0
-    stops = ",".join(f'{c["color"]} {i * seg}deg {(i + 1) * seg}deg' for i, c in enumerate(CATS))
-    labels = "".join(
-        f'<span class="wl" style="transform:rotate({i * seg + seg / 2}deg) translateY(-64px) '
-        f'rotate({-(i * seg + seg / 2)}deg)">{c["emoji"]}</span>' for i, c in enumerate(CATS))
-    wstyle = (f"animation:sp{rnd} 3s cubic-bezier(.17,.67,.2,1) forwards;" if anim
-              else f"transform:rotate({final}deg);")
-    st.markdown(
-        f'<style>@keyframes sp{rnd}{{from{{transform:rotate(0deg)}}to{{transform:rotate({final}deg)}}}}'
-        f'@keyframes rv{rnd}{{from{{opacity:0}}to{{opacity:1}}}}</style>'
-        f'<div class="wheelwrap"><div class="ptr">▼</div>'
-        f'<div class="wheel" style="background:conic-gradient({stops});{wstyle}">{labels}</div>'
-        f'<div class="hub"></div></div>', unsafe_allow_html=True)
-
+    answers, hist = list(room["answers"]), list(room["hist"])
+    is_me = bool(player) and player in ss.my_names
     presenter = esc(room["presenter"]) or "—"
-    player = esc(room["player"])
-    who = f'<div class="small">الدور على: <b>{player}</b></div>' if player else ""
     pres_html = f'<div class="presenter">اسم المقدم : {presenter}</div>'
 
-    with st.container(key="resbox"):
-        if idx is None:
-            st.markdown(
-                '<div class="center"><div style="font-size:35px">👀</div>' + pres_html +
-                '<div class="q">مستعدين؟</div>'
-                '<div class="small">بانتظار المقدم ليدير العجلة!</div></div>',
-                unsafe_allow_html=True)
-        else:
+    # ── مرحلة اختيار اللاعب ──
+    if stage in (None, "name"):
+        items = [{"label": n, "color": NAME_COLORS[i % len(NAME_COLORS)]} for i, n in enumerate(names)]
+        pidx = names.index(player) if player in names else None
+        st.markdown(wheel_html(items, nrnd, pidx, nanim and stage == "name", "nsp", True),
+                    unsafe_allow_html=True)
+        with st.container(key="resbox"):
+            if stage is None:
+                st.markdown('<div class="center"><div style="font-size:35px">👀</div>' + pres_html +
+                            '<div class="q">مستعدين؟</div>'
+                            '<div class="small">بانتظار المقدم ليدير عجلة الأسماء!</div></div>',
+                            unsafe_allow_html=True)
+            else:
+                wrap = (f'<div style="animation:rvnsp{nrnd} .6s ease 3s backwards">' if nanim else "<div>")
+                st.markdown(
+                    f'{wrap}<div class="center">{pres_html}<div class="small">الدور على</div>'
+                    f'<div class="who">🎤 {esc(player)}</div>'
+                    '<div class="small">بانتظار المقدم ليدير عجلة الأسئلة</div></div></div>',
+                    unsafe_allow_html=True)
+    # ── مرحلة السؤال ──
+    else:
+        tiles = "".join(
+            f'<div class="tile{" on" if i == idx else ""}" style="background:{c["color"]}">'
+            f'<div class="te">{c["emoji"]}</div><small>{c["name"]}</small></div>'
+            for i, c in enumerate(CATS))
+        st.markdown(f'<div class="tiles">{tiles}</div>', unsafe_allow_html=True)
+        items = [{"label": c["emoji"], "color": c["color"]} for c in CATS]
+        st.markdown(wheel_html(items, rnd, idx, anim, "sp", False), unsafe_allow_html=True)
+
+        with st.container(key="resbox"):
             c = CATS[idx]
             ans_html = "".join(
                 f'<div class="ans">💬 <b>{esc(a["who"]) or "لاعب"}</b> : {esc(a["text"])}</div>'
                 for a in answers)
             skip_html = '<div class="tag">⏭️ تم تجاهل السؤال</div>' if skipped else ""
-            wrap = (f'<div style="animation:rv{rnd} .6s ease 3s backwards">' if anim else "<div>")
+            wrap = (f'<div style="animation:rvsp{rnd} .6s ease 3s backwards">' if anim else "<div>")
             st.markdown(
                 f'{wrap}<div class="center"><span class="tag">{c["emoji"]} {c["name"]}</span>'
-                f'{pres_html}{who}'
+                f'{pres_html}<div class="small">الدور على: <b>{esc(player)}</b></div>'
                 f'<div class="q{" skipped" if skipped else ""}">{esc(q)}</div>'
                 f'<div class="small">الجولة رقم {rnd} · جاوب بصراحة أو اختر تحديًا!</div>'
                 f'{skip_html}</div>{ans_html}</div>',
                 unsafe_allow_html=True)
 
             if not skipped:
-                b1, b2 = st.columns(2)
-                b1.button("⏭️ تجاهل السؤال", key="skip_btn", on_click=do_skip)
-                b2.button("✍️ الإجابة", key="ans_btn", on_click=open_answer)
-                if ss.answering == rnd:
-                    with st.form("ans_form", clear_on_submit=True, border=False):
-                        st.text_input("✍️ اكتب إجابتك", key="ans_text",
-                                      placeholder="اكتب إجابتك هنا...")
-                        st.form_submit_button("إرسال", on_click=submit_answer)
+                if is_me:   # التخطي والإجابة لصاحب الاسم الطالع فقط
+                    b1, b2 = st.columns(2)
+                    b1.button("⏭️ تجاهل السؤال", key="skip_btn", on_click=do_skip)
+                    b2.button("✍️ الإجابة", key="ans_btn", on_click=open_answer)
+                    if ss.answering == rnd:
+                        with st.form("ans_form", clear_on_submit=True, border=False):
+                            st.text_input("✍️ اكتب إجابتك", key="ans_text",
+                                          placeholder="اكتب إجابتك هنا...")
+                            st.form_submit_button("إرسال", on_click=submit_answer)
+                else:
+                    st.markdown(f'<div class="center small">🔒 التجاهل والإجابة لـ «{esc(player)}» فقط</div>',
+                                unsafe_allow_html=True)
 
     st.markdown("**📜 سجل الجولات**")
     st.markdown('<div class="hist">' + ("".join(f"<span>{esc(h)}</span>" for h in hist)
                 or "<span>لم تبدأ اللعبة بعد</span>") + "</div>", unsafe_allow_html=True)
 
 
-live()
+def play_screen():
+    st.markdown(
+        '<div class="hero"><div style="font-size:38px">🎡✨</div><h1>ليلة المواجهة</h1>'
+        '<div class="sub">اسأل.. واجه.. واكتشف!</div>'
+        '<div class="tagline">لمّة حلوة 💗 — العبوا بروح مرحة واحترموا حق أي لاعب في تخطي السؤال.</div></div>',
+        unsafe_allow_html=True)
 
-# ══════════ أزرار المقدم ══════════
-if ss.is_host:
-    st.button("🎲 أدر عجلة الحظ!", on_click=spin, type="primary", key="spin_btn")
-    h1, h2 = st.columns(2)
-    h1.button("سؤال جديد ↻", on_click=new_q, key="newq_btn")
-    h2.button("إعادة ضبط", on_click=reset, key="reset_btn")
+    if ss.is_host:
+        with st.container(key="hostbox"):
+            st.markdown("**🎛️ لوحة المقدم**")
+            pres = st.text_input("اسم المقدم", value=room["presenter"], key="presenter_in",
+                                 placeholder="اسم المقدم...")
+            room["presenter"] = pres.strip()[:40]
+
+    live()
+
+    if ss.is_host:
+        st.button("🎯 أدر عجلة الأسماء!", on_click=spin_names, type="primary", key="spin_names_btn")
+        st.button("🎲 أدر عجلة الأسئلة!", on_click=spin_q, key="spin_btn")
+        h1, h2 = st.columns(2)
+        h1.button("سؤال جديد ↻", on_click=new_q, key="newq_btn")
+        h2.button("إعادة ضبط", on_click=reset, key="reset_btn")
+        st.button("✏️ رجوع لتسجيل الأسماء", on_click=back_to_register, key="back_reg_btn")
+
+
+# ══════════ التوجيه ══════════
+if ss.role is None:
+    entry_screen()
 else:
-    with st.expander("🔐 دخول المقدم"):
-        pin = st.text_input("رمز المقدم", type="password", key="pin_in", placeholder="اكتب الرمز...")
-        if st.button("دخول", key="login_btn"):
-            if pin == HOST_PIN:
-                ss.is_host = True
-                st.rerun()
-            else:
-                st.error("الرمز غير صحيح")
+    if room["phase"] == "register":
+        register_screen()
+    else:
+        play_screen()
+    st.button("↩️ تغيير الدور", on_click=logout, key="logout_btn")
