@@ -1,5 +1,7 @@
+import hmac
 import html
 import random
+import uuid
 import re
 import threading
 import streamlit as st
@@ -22,7 +24,15 @@ def _secret(key, default):
         return default
 
 
-HOST_PIN = str(_secret("HOST_PIN", "1234"))   # غيّره! أو حطه في .streamlit/secrets.toml
+# المقدمين ورمز كل واحد (غيّرها هنا، أو حطها في .streamlit/secrets.toml تحت [HOSTS])
+HOSTS = {
+    "الوليد": "1234",
+    "ＢＬＡＣＫ": "5678",
+}
+try:
+    HOSTS = {str(k): str(v) for k, v in st.secrets["HOSTS"].items()}
+except Exception:
+    pass
 
 # ══════════ الفئات والأسئلة ══════════
 CATS = [
@@ -153,6 +163,7 @@ NAME_COLORS = ["#e85d75", "#8064d8", "#e66b9a", "#e8a23a", "#249eaa", "#4d9a79",
 def get_room():
     return {
         "lock": threading.Lock(),
+        "host_tokens": {},              # اسم المقدم -> توقيع جلسته الحالية
         "phase": "register",            # register = تسجيل الأسماء | play = اللعب
         "names": [], "used_names": set(),
         "stage": None,                  # None | name | question
@@ -169,13 +180,21 @@ room = get_room()
 ss = st.session_state
 ss.setdefault("dark", False)
 ss.setdefault("role", None)          # None | player | host
-ss.setdefault("is_host", False)
+ss.setdefault("host_name", None)
+ss.setdefault("sid", uuid.uuid4().hex)
 ss.setdefault("ask_host", False)
 ss.setdefault("my_names", [])
 ss.setdefault("answering", None)
 ss.setdefault("flash", "")
 
 esc = html.escape
+
+
+
+def is_host():
+    """مقدم فعلي = سجّل دخول باسمه ورمزه، وجلسته هي آخر جلسة دخلت بهذا الاسم."""
+    return (ss.role == "host" and ss.host_name is not None
+            and room["host_tokens"].get(ss.host_name) == ss.sid)
 
 
 def _norm(s):
@@ -193,15 +212,22 @@ def want_host():
 
 
 def login_host():
-    if str(ss.get("pin_in", "")) == HOST_PIN:
-        ss.role, ss.is_host, ss.ask_host = "host", True, False
-        ss.flash = ""
+    name = ss.get("host_sel")
+    pin = str(ss.get("pin_in", ""))
+    real = HOSTS.get(name)
+    if real is not None and hmac.compare_digest(pin.encode(), real.encode()):
+        with room["lock"]:
+            room["host_tokens"][name] = ss.sid     # آخر دخول بهذا الاسم يلغي القديم
+            room["presenter"] = name
+        ss.role, ss.host_name, ss.ask_host, ss.flash = "host", name, False, ""
     else:
-        ss.flash = "الرمز غير صحيح"
+        ss.flash = "الاسم أو الرمز غير صحيح"
 
 
 def logout():
-    ss.role, ss.is_host, ss.ask_host, ss.flash = None, False, False, ""
+    if ss.host_name and room["host_tokens"].get(ss.host_name) == ss.sid:
+        room["host_tokens"].pop(ss.host_name, None)
+    ss.role, ss.host_name, ss.ask_host, ss.flash = None, None, False, ""
 
 
 # ══════════ التسجيل ══════════
@@ -234,7 +260,7 @@ def add_names():
 
 
 def remove_name(n):
-    if not ss.is_host:
+    if not is_host():
         return
     with room["lock"]:
         if n in room["names"]:
@@ -243,7 +269,7 @@ def remove_name(n):
 
 def confirm_names():
     """التأكيد للمقدم فقط."""
-    if not ss.is_host:
+    if not is_host():
         return
     with room["lock"]:
         if len(room["names"]) < 2:
@@ -255,7 +281,7 @@ def confirm_names():
 
 
 def back_to_register():
-    if not ss.is_host:
+    if not is_host():
         return
     with room["lock"]:
         room.update(phase="register", stage=None, player="", cat=None, q=None, anim=False,
@@ -264,7 +290,7 @@ def back_to_register():
 
 # ══════════ اللعب ══════════
 def spin_names():
-    if not ss.is_host:
+    if not is_host():
         return
     with room["lock"]:
         names = room["names"]
@@ -298,17 +324,17 @@ def _draw(keep_cat):
 
 
 def spin_q():
-    if ss.is_host and room["player"]:
+    if is_host() and room["player"]:
         _draw(False)
 
 
 def new_q():
-    if ss.is_host and room["player"]:
+    if is_host() and room["player"]:
         _draw(True)
 
 
 def reset():
-    if not ss.is_host:
+    if not is_host():
         return
     with room["lock"]:
         room.update(stage=None, player="", cat=None, q=None, anim=False, nanim=False,
@@ -489,6 +515,7 @@ def entry_screen():
         c2.button("🎤 مقدم", on_click=want_host, key="role_host")
         if ss.ask_host:
             with st.form("pin_form", border=False):
+                st.selectbox("اسم المقدم", list(HOSTS.keys()), key="host_sel")
                 st.text_input("رمز المقدم", type="password", key="pin_in", placeholder="اكتب الرمز...")
                 st.form_submit_button("دخول", on_click=login_host)
             if ss.flash:
@@ -509,7 +536,7 @@ def names_live():
             unsafe_allow_html=True)
     else:
         st.markdown('<div class="small">ما أحد سجّل للحين...</div>', unsafe_allow_html=True)
-    if ss.is_host:
+    if is_host():
         if names:
             with st.expander("🗑️ حذف اسم"):
                 for i, n in enumerate(names):
@@ -532,7 +559,7 @@ def register_screen():
             st.markdown(f'<div class="small">{esc(ss.flash)}</div>', unsafe_allow_html=True)
         names_live()
 
-    if ss.is_host:
+    if is_host():
         st.button("✅ تأكيد وبدء اللعبة", on_click=confirm_names, type="primary", key="confirm_btn")
     else:
         st.markdown('<div class="center small">⏳ التأكيد وبدء اللعبة من المقدم فقط</div>',
@@ -624,7 +651,7 @@ def play_screen():
         '<div class="tagline">لمّة حلوة 💗 — العبوا بروح مرحة واحترموا حق أي لاعب في تخطي السؤال.</div></div>',
         unsafe_allow_html=True)
 
-    if ss.is_host:
+    if is_host():
         with st.container(key="hostbox"):
             st.markdown("**🎛️ لوحة المقدم**")
             pres = st.text_input("اسم المقدم", value=room["presenter"], key="presenter_in",
@@ -633,7 +660,7 @@ def play_screen():
 
     live()
 
-    if ss.is_host:
+    if is_host():
         st.button("🎯 أدر عجلة الأسماء!", on_click=spin_names, type="primary", key="spin_names_btn")
         st.button("🎲 أدر عجلة الأسئلة!", on_click=spin_q, key="spin_btn")
         h1, h2 = st.columns(2)
@@ -643,6 +670,9 @@ def play_screen():
 
 
 # ══════════ التوجيه ══════════
+if ss.role == "host" and not is_host():
+    ss.role, ss.host_name = None, None
+    ss.flash = "تم تسجيل الدخول بهذا الاسم من جهاز آخر"
 if ss.role is None:
     entry_screen()
 else:
