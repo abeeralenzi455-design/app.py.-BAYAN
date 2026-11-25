@@ -247,7 +247,8 @@ def add_names():
             else:
                 room["names"].append(p)
                 have.add(_norm(p))
-                ss.my_names.append(p)
+                if not is_host():          # أسماء المقدم ما تعطيه صلاحية التجاهل
+                    ss.my_names.append(p)
                 added += 1
     msg = []
     if added:
@@ -345,7 +346,7 @@ def reset():
 
 def _is_turn_owner():
     p = room["player"]
-    return bool(p) and p in ss.my_names
+    return bool(p) and p in ss.my_names and not is_host()   # المقدم ما يتجاهل ولا يجاوب أبدًا
 
 
 def do_skip():
@@ -577,7 +578,7 @@ def live():
     nrnd, nanim = room["nround"], room["nanim"]
     anim, skipped = room["anim"], room["skipped"]
     answers, hist = list(room["answers"]), list(room["hist"])
-    is_me = bool(player) and player in ss.my_names
+    is_me = bool(player) and player in ss.my_names and not is_host()
     presenter = esc(room["presenter"]) or "—"
     pres_html = f'<div class="presenter">اسم المقدم : {presenter}</div>'
 
