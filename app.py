@@ -188,6 +188,7 @@ def get_room():
 
 
 room = get_room()
+room.setdefault("gid", 0)            # رقم اللعبة: يزيد كل ما المقدم يبدأ لعبة جديدة
 ss = st.session_state
 ss.setdefault("dark", False)
 ss.setdefault("role", None)          # None | player | host
@@ -197,6 +198,10 @@ ss.setdefault("ask_host", False)
 ss.setdefault("my_names", [])
 ss.setdefault("answering", None)
 ss.setdefault("flash", "")
+if ss.get("my_gid") != room["gid"]:   # لعبة جديدة => ينسى الجهاز أسماءه القديمة
+    ss.my_names = []
+    ss.answering = None
+    ss.my_gid = room["gid"]
 
 esc = html.escape
 
@@ -298,6 +303,23 @@ def back_to_register():
     with room["lock"]:
         room.update(phase="register", stage=None, player="", cat=None, q=None, anim=False,
                     nanim=False, answers=[], skipped=False)
+
+
+def new_game():
+    """لعبة جديدة بالكامل: يمسح كل الأسماء والجولات ويرجع للتسجيل. للمقدم فقط."""
+    if not is_host():
+        return
+    with room["lock"]:
+        room.update(phase="register", names=[], stage=None, player="", cat=None, q=None,
+                    anim=False, nanim=False, answers=[], skipped=False, hist=[],
+                    round=0, nround=0)
+        room["used"].clear()
+        room["used_names"].clear()
+        room["gid"] += 1
+    ss.my_gid = room["gid"]
+    ss.my_names = []
+    ss.answering = None
+    ss.flash = ""
 
 
 # ══════════ اللعب ══════════
@@ -573,6 +595,7 @@ def register_screen():
 
     if is_host():
         st.button("✅ تأكيد وبدء اللعبة", on_click=confirm_names, type="primary", key="confirm_btn")
+        st.button("🆕 لعبة جديدة (مسح كل الأسماء)", on_click=new_game, key="new_game_reg_btn")
     else:
         st.markdown('<div class="center small">⏳ التأكيد وبدء اللعبة من المقدم فقط</div>',
                     unsafe_allow_html=True)
@@ -679,6 +702,7 @@ def play_screen():
         h1.button("سؤال جديد ↻", on_click=new_q, key="newq_btn")
         h2.button("إعادة ضبط", on_click=reset, key="reset_btn")
         st.button("✏️ رجوع لتسجيل الأسماء", on_click=back_to_register, key="back_reg_btn")
+        st.button("🆕 لعبة جديدة (مسح كل الأسماء)", on_click=new_game, key="new_game_btn")
 
 
 # ══════════ التوجيه ══════════
